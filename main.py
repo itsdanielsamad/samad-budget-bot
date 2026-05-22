@@ -5,7 +5,7 @@ replies with remaining balance for the category."""
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, time, timezone, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -85,6 +85,7 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "  Amazon 320 — for clothes\n\n"
         "/balance Groceries — see remaining for a line item\n"
         "/undo — mark last logged transaction as Reversed\n"
+        "/drain — manually run the Carry Over drain (auto-runs on the 1st)\n"
     )
 
 
@@ -236,6 +237,46 @@ async def _log_and_reply_from_callback(query, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text(reply)
 
 
+async def monthly_drain_job(context: ContextTypes.DEFAULT_TYPE):
+    """Runs on the 1st of each month at 00:05 UAE. Decrements Carry Over Balance values
+    by the monthly budget for each line item, then notifies allowlisted users."""
+    log.info("Running monthly Carry Over drain…")
+    try:
+        drained = sheets.drain_carry_over_balances()
+        log.info("Drained %d items", len(drained))
+        if drained:
+            lines = [f"• {item}: AED {_fmt_aed(old)} → AED {_fmt_aed(new)}" for item, old, new in drained]
+            summary = "Monthly Carry Over drain (1st of month):\n\n" + "\n".join(lines)
+        else:
+            summary = "Monthly check: no Carry Over balances needed draining."
+    except Exception as e:
+        log.exception("Monthly drain failed: %s", e)
+        summary = f"⚠️ Monthly drain failed: {e}"
+    for user_id in config.ALLOWED_TELEGRAM_USER_IDS:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=summary)
+        except Exception as e:
+            log.warning("Couldn't notify %d: %s", user_id, e)
+
+
+async def cmd_drain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual trigger of the carry-over drain. For testing — auto-runs on the 1st anyway."""
+    if not _user_is_allowed(update.effective_user.id):
+        return
+    await update.message.reply_text("Running Carry Over drain now…")
+    try:
+        drained = sheets.drain_carry_over_balances()
+    except Exception as e:
+        log.exception("Manual drain failed: %s", e)
+        await update.message.reply_text(f"⚠️ Drain failed: {e}")
+        return
+    if drained:
+        lines = [f"• {item}: AED {_fmt_aed(old)} → AED {_fmt_aed(new)}" for item, old, new in drained]
+        await update.message.reply_text("Drained:\n\n" + "\n".join(lines))
+    else:
+        await update.message.reply_text("Nothing to drain — no positive Carry Over balances.")
+
+
 async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = context.user_data.get("last_logged_row")
     if not row:
@@ -257,8 +298,21 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("undo", cmd_undo))
+    app.add_handler(CommandHandler("drain", cmd_drain))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
+
+    # Schedule Carry Over auto-drain for the 1st of every month at 00:05 UAE
+    if app.job_queue:
+        app.job_queue.run_monthly(
+            callback=monthly_drain_job,
+            when=time(hour=0, minute=5, tzinfo=UAE_TZ),
+            day=1,
+        )
+        log.info("Scheduled monthly Carry Over drain for day=1 at 00:05 UAE")
+    else:
+        log.warning("Job queue not available — Carry Over drain will not auto-run")
+
     log.info("Bot ready. Polling…")
     app.run_polling(drop_pending_updates=True)
 
