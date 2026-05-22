@@ -5,6 +5,7 @@ replies with remaining balance for the category."""
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, time, timezone, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -87,6 +88,7 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "/undo — mark last logged transaction as Reversed\n"
         "/drain — manually run the Carry Over drain (auto-runs on the 1st)\n"
         "/digest — show this week's digest now (auto-sends every Sunday 20:00)\n"
+        "/report [month] — month summary. Try /report, /report 4, /report apr\n"
     )
 
 
@@ -291,6 +293,136 @@ def _build_weekly_digest() -> str:
     return "\n".join(parts)
 
 
+def _parse_report_arg(arg: str) -> tuple[int, int] | None:
+    """Parse '/report' arg into (year, month). Accepts '4', 'apr', 'April', '2026-04', '04-2026', etc."""
+    if not arg:
+        return None
+    arg = arg.strip().lower()
+    now = datetime.now(UAE_TZ)
+    month_names = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                   "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+    # YYYY-MM
+    m = re.match(r"^(\d{4})[-/](\d{1,2})$", arg)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    # MM-YYYY
+    m = re.match(r"^(\d{1,2})[-/](\d{4})$", arg)
+    if m:
+        return int(m.group(2)), int(m.group(1))
+    # month name
+    for name, num in month_names.items():
+        if arg.startswith(name):
+            return now.year, num
+    # plain integer 1-12
+    try:
+        n = int(arg)
+        if 1 <= n <= 12:
+            return now.year, n
+    except ValueError:
+        pass
+    return None
+
+
+def _build_month_report(year: int, month: int) -> str:
+    """Comprehensive month report — income, spend by category, top vendors/txns, by payer."""
+    month_name = datetime(year, month, 1).strftime("%B %Y")
+    txns = sheets.get_transactions_for_month(year, month)
+    lines = sheets.get_expense_lines()
+    income = sheets.get_monthly_income_budget()
+
+    budget_by_cat: dict[str, float] = {}
+    for ln in lines:
+        budget_by_cat[ln.category] = budget_by_cat.get(ln.category, 0.0) + ln.budget
+
+    mtd_by_cat: dict[str, float] = {}
+    mtd_by_vendor: dict[str, float] = {}
+    mtd_by_payer: dict[str, float] = {}
+    for t in txns:
+        mtd_by_cat[t.category] = mtd_by_cat.get(t.category, 0.0) + t.amount
+        if t.vendor:
+            mtd_by_vendor[t.vendor] = mtd_by_vendor.get(t.vendor, 0.0) + t.amount
+        if t.payer:
+            mtd_by_payer[t.payer] = mtd_by_payer.get(t.payer, 0.0) + t.amount
+
+    total_actual = sum(mtd_by_cat.values())
+    total_budget = sum(budget_by_cat.values())
+    surplus_actual = income - total_actual
+    surplus_budget = income - total_budget
+
+    parts: list[str] = []
+    parts.append(f"📋 Month report — {month_name}")
+    parts.append("")
+    parts.append(f"Transactions logged: {len(txns)}")
+    parts.append(f"Income (budgeted):   AED {_fmt_aed(income)}")
+    parts.append(f"Spent (actual):      AED {_fmt_aed(total_actual)}")
+    parts.append(f"Budget (planned):    AED {_fmt_aed(total_budget)}")
+    parts.append(f"Surplus (actual):    AED {_fmt_aed(surplus_actual)}")
+    parts.append(f"Surplus (budgeted):  AED {_fmt_aed(surplus_budget)}")
+    parts.append("")
+
+    parts.append("By category:")
+    for cat in sorted(budget_by_cat.keys()):
+        budget = budget_by_cat[cat]
+        actual = mtd_by_cat.get(cat, 0.0)
+        pct = (actual / budget * 100) if budget > 0 else 0
+        if pct < 80:
+            icon = "🟢"
+        elif pct < 100:
+            icon = "🟡"
+        else:
+            icon = "🔴"
+        parts.append(f"  {icon} {cat}: AED {_fmt_aed(actual)} / AED {_fmt_aed(budget)} ({pct:.0f}%)")
+    parts.append("")
+
+    if mtd_by_vendor:
+        parts.append("Top vendors:")
+        for vendor, amt in sorted(mtd_by_vendor.items(), key=lambda x: -x[1])[:5]:
+            parts.append(f"  • {vendor}: AED {_fmt_aed(amt)}")
+        parts.append("")
+
+    if txns:
+        top_txns = sorted(txns, key=lambda t: -abs(t.amount))[:5]
+        parts.append("Largest transactions:")
+        for t in top_txns:
+            label = t.vendor or t.line_item
+            parts.append(f"  • {t.date.strftime('%d %b')} {label}: AED {_fmt_aed(t.amount)}")
+        parts.append("")
+
+    if mtd_by_payer:
+        parts.append("By payer:")
+        for payer, amt in sorted(mtd_by_payer.items(), key=lambda x: -x[1]):
+            parts.append(f"  • {payer}: AED {_fmt_aed(amt)}")
+
+    return "\n".join(parts)
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Month report — usage: /report, /report 4, /report apr, /report 2026-04."""
+    if not _user_is_allowed(update.effective_user.id):
+        return
+    now = datetime.now(UAE_TZ)
+    year, month = now.year, now.month
+    if context.args:
+        parsed = _parse_report_arg(" ".join(context.args))
+        if parsed:
+            year, month = parsed
+        else:
+            await update.message.reply_text(
+                "Couldn't parse that month. Try /report, /report 4, /report apr, or /report 2026-04."
+            )
+            return
+    try:
+        text = _build_month_report(year, month)
+    except Exception as e:
+        log.exception("Report failed: %s", e)
+        await update.message.reply_text(f"⚠️ Report failed: {e}")
+        return
+    # Telegram message limit is 4096; chunk if needed
+    while text:
+        chunk, text = text[:4000], text[4000:]
+        await update.message.reply_text(chunk)
+
+
 async def weekly_digest_job(context: ContextTypes.DEFAULT_TYPE):
     log.info("Running weekly digest…")
     try:
@@ -381,6 +513,7 @@ def main():
     app.add_handler(CommandHandler("undo", cmd_undo))
     app.add_handler(CommandHandler("drain", cmd_drain))
     app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
 
