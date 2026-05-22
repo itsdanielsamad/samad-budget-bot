@@ -26,6 +26,17 @@ log = logging.getLogger("vault42")
 
 UAE_TZ = timezone(timedelta(hours=4))
 
+
+def _fmt_aed(n: float) -> str:
+    """Format a number for an AED reply — no decimal if whole, two decimals otherwise."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    if n == int(n):
+        return f"{int(n):,}"
+    return f"{n:,.2f}"
+
 sheets = SheetsClient()
 _vendor_memory_cache: list = []
 _line_items_cache: list = []
@@ -102,9 +113,9 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     budget, actual, remaining = res
     await update.message.reply_text(
         f"{item} ({cat})\n"
-        f"Budget: AED {budget:,.0f}\n"
-        f"Spent MTD: AED {actual:,.0f}\n"
-        f"Remaining: AED {remaining:,.0f}"
+        f"Budget: AED {_fmt_aed(budget)}\n"
+        f"Spent MTD: AED {_fmt_aed(actual)}\n"
+        f"Remaining: AED {_fmt_aed(remaining)}"
     )
 
 
@@ -193,10 +204,11 @@ async def _log_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, par
     )
     context.user_data["last_logged_row"] = row
     res = sheets.get_remaining_balance(parsed.category, parsed.line_item)
-    remaining_str = f"AED {res[2]:,.0f}" if res else "unknown"
-    reply = parsed.suggested_reply.replace("<REMAINING_PLACEHOLDER>", remaining_str)
-    if not reply:
-        reply = f"Logged AED {parsed.amount:,.0f} to {parsed.line_item}. Remaining: {remaining_str}."
+    if res:
+        reply = (f"Logged AED {_fmt_aed(parsed.amount)} to {parsed.line_item}. "
+                 f"Remaining this month: AED {_fmt_aed(res[2])}.")
+    else:
+        reply = f"Logged AED {_fmt_aed(parsed.amount)} to {parsed.line_item}."
     await update.message.reply_text(reply)
 
 
@@ -216,10 +228,11 @@ async def _log_and_reply_from_callback(query, context: ContextTypes.DEFAULT_TYPE
     )
     context.user_data["last_logged_row"] = row
     res = sheets.get_remaining_balance(parsed.category, parsed.line_item)
-    remaining_str = f"AED {res[2]:,.0f}" if res else "unknown"
-    reply = parsed.suggested_reply.replace("<REMAINING_PLACEHOLDER>", remaining_str)
-    if not reply:
-        reply = f"Logged AED {parsed.amount:,.0f} to {parsed.line_item}. Remaining: {remaining_str}."
+    if res:
+        reply = (f"Logged AED {_fmt_aed(parsed.amount)} to {parsed.line_item}. "
+                 f"Remaining this month: AED {_fmt_aed(res[2])}.")
+    else:
+        reply = f"Logged AED {_fmt_aed(parsed.amount)} to {parsed.line_item}."
     await query.edit_message_text(reply)
 
 
