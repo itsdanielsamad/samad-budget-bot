@@ -71,6 +71,17 @@ class SheetsClient:
         self._gc = gspread.authorize(creds)
         self._sh = self._gc.open_by_key(config.SPREADSHEET_ID)
 
+    # ---------- Income (budget reference) ----------
+    def get_monthly_income_budget(self) -> float:
+        """Read total monthly income from the Income tab (cell E20)."""
+        try:
+            ws = self._sh.worksheet("Income")
+            val = ws.acell("E20").value
+            return _parse_money(val or "0")
+        except Exception as e:
+            log.warning("Couldn't read income budget: %s", e)
+            return 0.0
+
     # ---------- Vendor Memory ----------
     def get_vendor_memory(self) -> list[VendorMemoryEntry]:
         ws = self._sh.worksheet(config.TAB_VENDOR_MEMORY)
