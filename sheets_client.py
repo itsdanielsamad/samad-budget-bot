@@ -149,6 +149,38 @@ class SheetsClient:
                 return i + 1
         return len(col_b) + 1
 
+    # ---------- Carry Over auto-drain (1st of month) ----------
+    def drain_carry_over_balances(self) -> list[tuple[str, float, float]]:
+        """For each expense line on the Expenses tab, reduce Carry Over Balance (col F)
+        by Monthly Budget (col D), floored at 0. Returns [(line_item, old, new)] for items drained."""
+        ws = self._sh.worksheet(config.TAB_EXPENSES)
+        rows = ws.get_all_values()
+        drained: list[tuple[str, float, float]] = []
+        updates: list[dict] = []
+        for idx, r in enumerate(rows, start=1):
+            if not r or len(r) < 6:
+                continue
+            item = r[1].strip() if len(r) > 1 else ""
+            if not item:
+                continue
+            # Skip category headers (e.g. "1.  Housing & Utilities")
+            if item[0].isdigit() and "." in item[:3]:
+                continue
+            if (item.startswith("Subtotal") or item.startswith("GRAND")
+                    or item.startswith("Annual")):
+                continue
+            budget = _parse_money(r[3] if len(r) > 3 else "")
+            carry = _parse_money(r[5] if len(r) > 5 else "")
+            if budget <= 0 or carry <= 0:
+                continue
+            new_carry = max(0.0, carry - budget)
+            if abs(new_carry - carry) > 0.001:
+                updates.append({"range": f"F{idx}", "values": [[new_carry]]})
+                drained.append((item, carry, new_carry))
+        if updates:
+            ws.batch_update(updates, value_input_option="USER_ENTERED")
+        return drained
+
     # ---------- Read live balance for a line item ----------
     def get_remaining_balance(self, category: str, line_item: str) -> Optional[tuple[float, float, float]]:
         """Return (budget, actual_mtd, remaining) for the given line item."""
