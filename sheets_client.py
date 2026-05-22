@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -19,11 +20,28 @@ SCOPES = [
 ]
 
 
+def _parse_money(s: str) -> float:
+    """Extract a number from a cell that might say 'AED 4,000', '(AED 3,000)', '4000', or ''."""
+    if not s:
+        return 0.0
+    s = str(s).strip()
+    is_neg = s.startswith("(") and s.endswith(")")
+    cleaned = s.replace("AED", "").replace(",", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+    if not m:
+        return 0.0
+    try:
+        n = float(m.group())
+        return -n if (is_neg and n > 0) else n
+    except ValueError:
+        return 0.0
+
+
 @dataclass
 class ExpenseLine:
-    category: str          # e.g. "Food, Health & Lifestyle"
-    line_item: str         # e.g. "Groceries"
-    budget: float          # monthly AED
+    category: str
+    line_item: str
+    budget: float
 
 
 @dataclass
@@ -46,10 +64,8 @@ class SheetsClient:
     def get_vendor_memory(self) -> list[VendorMemoryEntry]:
         ws = self._sh.worksheet(config.TAB_VENDOR_MEMORY)
         rows = ws.get_all_values()
-        # Headers are at row 5 (rows[4]); data starts row 6 (rows[5])
         entries = []
         for r in rows[5:]:
-            # Skip the leading blank column A; vendor is in col B (index 1)
             if len(r) < 4 or not r[1].strip():
                 continue
             entries.append(
@@ -67,27 +83,21 @@ class SheetsClient:
         """Return every line item with its category + monthly budget."""
         ws = self._sh.worksheet(config.TAB_EXPENSES)
         rows = ws.get_all_values()
-        # Row 5 = header; categories announced via merged header rows
-        # We walk down and track the current category from "1. ", "2. " etc. headers
         current_cat = None
         out: list[ExpenseLine] = []
         for r in rows:
-            if not r or len(r) < 4:
+            if not r or len(r) < 2:
                 continue
             item = r[1].strip() if len(r) > 1 else ""
             # Category header lines like "1.  Housing & Utilities"
             if item and item[0].isdigit() and "." in item[:3]:
-                # strip leading "1.  " etc.
                 current_cat = item.split(". ", 1)[-1].strip()
                 continue
-            if item.startswith("Subtotal") or item.startswith("GRAND") or not item or item.startswith("Annual"):
+            if (item.startswith("Subtotal") or item.startswith("GRAND")
+                    or not item or item.startswith("Annual")):
                 continue
-            budget_str = r[3].strip() if len(r) > 3 else ""
-            # Skip non-numeric budget cells
-            try:
-                budget = float(budget_str.replace(",", "")) if budget_str else 0.0
-            except ValueError:
-                continue
+            budget_str = r[3] if len(r) > 3 else ""
+            budget = _parse_money(budget_str)
             if current_cat:
                 out.append(ExpenseLine(category=current_cat, line_item=item, budget=budget))
         return out
@@ -122,12 +132,7 @@ class SheetsClient:
             status,
             notes,
         ]
-        # The Spent Bucket has a header at row 5, examples 6..10, summary at 13+.
-        # Find the first empty row after row 10. Simplest: append after the last filled row.
-        # gspread's append_row writes after the last row with data — but Spent Bucket has summary block.
-        # So we'll find the next empty row in range B11:B200.
         next_row = self._find_next_spent_bucket_row(ws)
-        # Column B is timestamp (column index 2)
         ws.update(
             range_name=f"B{next_row}:M{next_row}",
             values=[row],
@@ -138,20 +143,16 @@ class SheetsClient:
 
     def _find_next_spent_bucket_row(self, ws) -> int:
         """Find first empty row at or after row 11 in column B."""
-        col_b = ws.col_values(2)  # column B values, 1-indexed list
-        # Start scanning at index 10 (i.e., row 11). The list is 0-indexed.
+        col_b = ws.col_values(2)
         for i in range(10, len(col_b)):
             if not col_b[i].strip():
-                return i + 1  # convert to 1-indexed
+                return i + 1
         return len(col_b) + 1
 
     # ---------- Read live balance for a line item ----------
     def get_remaining_balance(self, category: str, line_item: str) -> Optional[tuple[float, float, float]]:
-        """Return (budget, actual_mtd, remaining) for the given line item.
-        Reads the Expenses tab where SUMIFS already does the work.
-        Returns None if the line item isn't found."""
+        """Return (budget, actual_mtd, remaining) for the given line item."""
         ws = self._sh.worksheet(config.TAB_EXPENSES)
-        # Read columns B (Item), D (Budget), E (Actual). Adjust as Expenses grows.
         b_col = ws.col_values(2)
         d_col = ws.col_values(4)
         e_col = ws.col_values(5)
@@ -164,13 +165,7 @@ class SheetsClient:
                 current_cat = item.split(". ", 1)[-1].strip()
                 continue
             if item == line_item and current_cat == category:
-                try:
-                    budget = float(d_col[i].replace("AED", "").replace(",", "").strip() or 0)
-                except (ValueError, IndexError):
-                    budget = 0.0
-                try:
-                    actual = float(e_col[i].replace("AED", "").replace(",", "").strip() or 0)
-                except (ValueError, IndexError):
-                    actual = 0.0
+                budget = _parse_money(d_col[i] if i < len(d_col) else "")
+                actual = _parse_money(e_col[i] if i < len(e_col) else "")
                 return budget, actual, budget - actual
         return None
