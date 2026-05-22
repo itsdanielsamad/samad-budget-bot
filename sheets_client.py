@@ -71,6 +71,33 @@ class SheetsClient:
         self._gc = gspread.authorize(creds)
         self._sh = self._gc.open_by_key(config.SPREADSHEET_ID)
 
+    # ---------- Vendor learning (add new mapping to Vendor Memory) ----------
+    def add_vendor_to_memory(self, vendor: str, category: str, line_item: str, notes: str = "") -> bool:
+        """Append a vendor → category/line_item mapping to Vendor Memory if not already present.
+        Returns True if added, False if already present (or vendor blank)."""
+        if not vendor or not vendor.strip() or vendor.strip() in {"-", "—"}:
+            return False
+        ws = self._sh.worksheet(config.TAB_VENDOR_MEMORY)
+        rows = ws.get_all_values()
+        vendor_lower = vendor.strip().lower()
+        # Check if already there (case-insensitive vendor match)
+        for r in rows[5:]:
+            if len(r) > 1 and r[1].strip().lower() == vendor_lower:
+                return False
+        # Find first empty row at or after row 6 (data section)
+        next_row = len(rows) + 1
+        for i in range(5, len(rows)):
+            if not rows[i] or len(rows[i]) < 2 or not rows[i][1].strip():
+                next_row = i + 1
+                break
+        ws.update(
+            range_name=f"B{next_row}:E{next_row}",
+            values=[[vendor.strip(), category, line_item, notes or "Auto-learned via bot"]],
+            value_input_option="USER_ENTERED",
+        )
+        log.info("Added vendor to memory at row %d: %s → %s / %s", next_row, vendor, category, line_item)
+        return True
+
     # ---------- Income (budget reference) ----------
     def get_monthly_income_budget(self) -> float:
         """Read total monthly income from the Income tab (cell E20)."""
