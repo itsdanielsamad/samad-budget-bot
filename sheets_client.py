@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 
 import gspread
@@ -50,6 +50,17 @@ class VendorMemoryEntry:
     category: str
     line_item: str
     notes: str = ""
+
+
+@dataclass
+class Transaction:
+    date: date
+    payer: str
+    amount: float
+    line_item: str
+    category: str
+    vendor: str
+    status: str
 
 
 class SheetsClient:
@@ -148,6 +159,51 @@ class SheetsClient:
             if not col_b[i].strip():
                 return i + 1
         return len(col_b) + 1
+
+    # ---------- Read transactions for a month (digest/reports) ----------
+    def get_transactions_for_month(self, year: int, month: int) -> list[Transaction]:
+        """Read Spent Bucket and return Confirmed transactions for the given year/month."""
+        ws = self._sh.worksheet(config.TAB_SPENT_BUCKET)
+        rows = ws.get_all_values()
+        out: list[Transaction] = []
+        # Header at row 5; data starts row 6 (rows[5])
+        for r in rows[5:]:
+            if len(r) < 10 or not r[1].strip():
+                continue
+            try:
+                row_year = int(r[8]) if r[8].strip() else 0
+                row_month = int(r[9]) if r[9].strip() else 0
+            except ValueError:
+                continue
+            if row_year != year or row_month != month:
+                continue
+            status = r[11].strip() if len(r) > 11 else "Confirmed"
+            if status == "Reversed":
+                continue
+            ts_raw = r[1].strip()
+            ts = None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    ts = datetime.strptime(ts_raw, fmt)
+                    break
+                except ValueError:
+                    pass
+            if ts is None:
+                continue
+            try:
+                amount = _parse_money(r[5])
+            except Exception:
+                continue
+            out.append(Transaction(
+                date=ts.date(),
+                payer=r[2].strip() if len(r) > 2 else "",
+                amount=amount,
+                line_item=r[6].strip() if len(r) > 6 else "",
+                category=r[7].strip() if len(r) > 7 else "",
+                vendor=r[4].strip() if len(r) > 4 else "",
+                status=status,
+            ))
+        return out
 
     # ---------- Carry Over auto-drain (1st of month) ----------
     def drain_carry_over_balances(self) -> list[tuple[str, float, float]]:
