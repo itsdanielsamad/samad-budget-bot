@@ -44,6 +44,24 @@ _line_items_cache: list = []
 _cache_loaded_at: datetime | None = None
 
 
+def _invalidate_caches():
+    """Force the next access to re-pull from Sheets (used after vendor learning)."""
+    global _cache_loaded_at
+    _cache_loaded_at = None
+
+
+def _learn_vendor(vendor: str, category: str, line_item: str):
+    """Try to add a vendor → category mapping to Vendor Memory.
+    Silently no-ops if vendor is empty or already present."""
+    try:
+        added = sheets.add_vendor_to_memory(vendor, category, line_item)
+        if added:
+            log.info("Learned vendor: %s → %s / %s", vendor, category, line_item)
+            _invalidate_caches()
+    except Exception as e:
+        log.warning("Couldn't learn vendor %s: %s", vendor, e)
+
+
 def _refresh_caches_if_stale(max_age_minutes: int = 60):
     """Re-pull Vendor Memory + Expense line items at most every hour."""
     global _vendor_memory_cache, _line_items_cache, _cache_loaded_at
@@ -207,6 +225,8 @@ async def _log_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, par
         notes=parsed.reasoning,
     )
     context.user_data["last_logged_row"] = row
+    # Learn this vendor for next time (safe no-op if already in Memory)
+    _learn_vendor(parsed.vendor, parsed.category, parsed.line_item)
     res = sheets.get_remaining_balance(parsed.category, parsed.line_item)
     if res:
         reply = (f"Logged AED {_fmt_aed(parsed.amount)} to {parsed.line_item}. "
@@ -231,6 +251,8 @@ async def _log_and_reply_from_callback(query, context: ContextTypes.DEFAULT_TYPE
         notes=parsed.reasoning,
     )
     context.user_data["last_logged_row"] = row
+    # Learn this vendor for next time (user just explicitly confirmed/corrected the mapping)
+    _learn_vendor(parsed.vendor, parsed.category, parsed.line_item)
     res = sheets.get_remaining_balance(parsed.category, parsed.line_item)
     if res:
         reply = (f"Logged AED {_fmt_aed(parsed.amount)} to {parsed.line_item}. "
