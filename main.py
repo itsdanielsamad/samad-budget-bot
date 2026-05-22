@@ -86,6 +86,7 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "/balance Groceries — see remaining for a line item\n"
         "/undo — mark last logged transaction as Reversed\n"
         "/drain — manually run the Carry Over drain (auto-runs on the 1st)\n"
+        "/digest — show this week's digest now (auto-sends every Sunday 20:00)\n"
     )
 
 
@@ -237,6 +238,86 @@ async def _log_and_reply_from_callback(query, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text(reply)
 
 
+def _build_weekly_digest() -> str:
+    """Assemble the Sunday weekly digest text (plain text, no Markdown)."""
+    now = datetime.now(UAE_TZ)
+    week_end = now.date()
+    week_start = week_end - timedelta(days=6)
+
+    txns = sheets.get_transactions_for_month(now.year, now.month)
+    lines = sheets.get_expense_lines()
+
+    budget_by_cat: dict[str, float] = {}
+    for ln in lines:
+        budget_by_cat[ln.category] = budget_by_cat.get(ln.category, 0.0) + ln.budget
+
+    week_total = 0.0
+    week_by_cat: dict[str, float] = {}
+    mtd_by_cat: dict[str, float] = {}
+    for t in txns:
+        mtd_by_cat[t.category] = mtd_by_cat.get(t.category, 0.0) + t.amount
+        if week_start <= t.date <= week_end:
+            week_total += t.amount
+            week_by_cat[t.category] = week_by_cat.get(t.category, 0.0) + t.amount
+
+    parts: list[str] = []
+    parts.append(f"📊 Weekly digest — {now.strftime('%a %d %b %Y')}")
+    parts.append("")
+    parts.append(f"This week ({week_start.strftime('%d %b')}–{week_end.strftime('%d %b')}):")
+    parts.append(f"  Total spent: AED {_fmt_aed(week_total)}")
+    if week_by_cat:
+        for cat, amt in sorted(week_by_cat.items(), key=lambda x: -x[1]):
+            parts.append(f"  • {cat}: AED {_fmt_aed(amt)}")
+    else:
+        parts.append("  (no transactions logged this week)")
+    parts.append("")
+    parts.append("Month-to-date status:")
+    for cat in sorted(budget_by_cat.keys()):
+        budget = budget_by_cat[cat]
+        actual = mtd_by_cat.get(cat, 0.0)
+        pct = (actual / budget * 100) if budget > 0 else 0
+        if pct < 80:
+            icon = "🟢"
+        elif pct < 100:
+            icon = "🟡"
+        else:
+            icon = "🔴"
+        parts.append(f"  {icon} {cat}: AED {_fmt_aed(actual)} / {_fmt_aed(budget)} ({pct:.0f}%)")
+    mtd_total = sum(mtd_by_cat.values())
+    budget_total = sum(budget_by_cat.values())
+    parts.append("")
+    parts.append(f"MTD total: AED {_fmt_aed(mtd_total)} / AED {_fmt_aed(budget_total)} ({(mtd_total/budget_total*100) if budget_total > 0 else 0:.0f}%)")
+
+    return "\n".join(parts)
+
+
+async def weekly_digest_job(context: ContextTypes.DEFAULT_TYPE):
+    log.info("Running weekly digest…")
+    try:
+        text = _build_weekly_digest()
+    except Exception as e:
+        log.exception("Weekly digest failed: %s", e)
+        text = f"⚠️ Weekly digest failed: {e}"
+    for user_id in config.ALLOWED_TELEGRAM_USER_IDS:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text)
+        except Exception as e:
+            log.warning("Couldn't send digest to %d: %s", user_id, e)
+
+
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual trigger of the weekly digest."""
+    if not _user_is_allowed(update.effective_user.id):
+        return
+    try:
+        text = _build_weekly_digest()
+    except Exception as e:
+        log.exception("Manual digest failed: %s", e)
+        await update.message.reply_text(f"⚠️ Digest failed: {e}")
+        return
+    await update.message.reply_text(text)
+
+
 async def monthly_drain_job(context: ContextTypes.DEFAULT_TYPE):
     """Runs on the 1st of each month at 00:05 UAE. Decrements Carry Over Balance values
     by the monthly budget for each line item, then notifies allowlisted users."""
@@ -299,6 +380,7 @@ def main():
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("undo", cmd_undo))
     app.add_handler(CommandHandler("drain", cmd_drain))
+    app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
 
@@ -310,8 +392,15 @@ def main():
             day=1,
         )
         log.info("Scheduled monthly Carry Over drain for day=1 at 00:05 UAE")
+        # Weekly digest every Sunday at 20:00 UAE (Python weekday: Mon=0 … Sun=6)
+        app.job_queue.run_daily(
+            callback=weekly_digest_job,
+            time=time(hour=20, minute=0, tzinfo=UAE_TZ),
+            days=(6,),
+        )
+        log.info("Scheduled weekly digest for Sunday 20:00 UAE")
     else:
-        log.warning("Job queue not available — Carry Over drain will not auto-run")
+        log.warning("Job queue not available — scheduled jobs will not auto-run")
 
     log.info("Bot ready. Polling…")
     app.run_polling(drop_pending_updates=True)
